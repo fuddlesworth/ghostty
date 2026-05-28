@@ -83,10 +83,36 @@ XkbTracker::XkbTracker() {
 }
 
 XkbTracker::~XkbTracker() {
-  // Process-wide singleton; OS reclaims at exit. Explicit teardown
-  // keeps leak checkers quiet and documents ownership.
-  if (m_keyboard) wl_keyboard_destroy(m_keyboard);
-  if (m_seat) wl_seat_destroy(m_seat);
+  // Process-wide singleton; only runs at process exit. We deliberately
+  // do NOT call wl_keyboard_destroy / wl_seat_destroy here even
+  // though they look like the "polite" symmetric teardown — the
+  // crash from doing so was observed in the wild as
+  //
+  //   #0 wl_proxy_destroy (libwayland-client.so.0)
+  //   #1 XkbTracker::~XkbTracker()
+  //   #2 exit (libc)
+  //   #3 __libc_start_main
+  //
+  // on every shutdown after a multi-surface session. The root cause
+  // is C++ static-destructor ordering across translation units:
+  // Qt's QApplication destructor closes the wl_display before our
+  // singleton's dtor runs, so by the time we get here every
+  // wl_proxy this tracker holds points at freed memory in
+  // libwayland-client's connection state. An earlier "fix" (commit
+  // c1a55b257) moved the seat onto the default queue to stop
+  // libwayland's "queue destroyed while proxies still attached"
+  // warning; that addressed the queue-attachment issue but not the
+  // larger lifetime-ordering issue (the display itself is gone,
+  // not just the queue).
+  //
+  // The OS reclaims the proxy memory at exit regardless, and any
+  // wl_keyboard / wl_seat sub-objects the compositor tracked are
+  // dropped server-side when our connection closes. Skipping the
+  // explicit destroys trades a cosmetic "leak" for a real
+  // not-crashing-at-exit.
+  //
+  // The libxkbcommon unrefs below are safe — they don't touch
+  // libwayland's state, just free libxkbcommon's heap allocations.
   if (m_state) xkb_state_unref(m_state);
   if (m_keymap) xkb_keymap_unref(m_keymap);
   if (m_ctx) xkb_context_unref(m_ctx);
