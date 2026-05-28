@@ -920,11 +920,17 @@ pub fn gtkNgDistResources(
         const xml_run = b.addRunArtifact(xml_exe);
 
         // Run our blueprint compiler across all of our blueprint files.
+        // Force ReleaseFast on the host build of this exe: Zig 0.15.2's
+        // bundled linker can't process the `.sframe` section that
+        // gcc 16+'s crt1.o emits in Debug mode, so a `linkLibC()` host
+        // exe at default-Debug fails to link on systems with newer gcc.
+        // Same workaround `vulkan_spvgen` already uses.
         const blueprint_exe = b.addExecutable(.{
             .name = "gtk_blueprint_compiler",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/apprt/gtk/build/blueprint.zig"),
                 .target = b.graph.host,
+                .optimize = .ReleaseFast,
             }),
         });
         blueprint_exe.linkLibC();

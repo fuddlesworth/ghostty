@@ -13,11 +13,17 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
     errdefer steps.deinit(b.allocator);
 
     // This is the exe used to generate some build data.
+    // Force ReleaseFast on the host build of this exe: Zig 0.15.2's
+    // bundled linker can't process the `.sframe` section that
+    // gcc 16+'s crt1.o emits in Debug mode, so a `linkLibC()` host
+    // exe at default-Debug fails to link on systems with newer gcc.
+    // Same workaround `vulkan_spvgen` already uses.
     const build_data_exe = b.addExecutable(.{
         .name = "ghostty-build-data",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main_build_data.zig"),
             .target = b.graph.host,
+            .optimize = .ReleaseFast,
             .strip = false,
             .omit_frame_pointer = false,
             .unwind_tables = .sync,
