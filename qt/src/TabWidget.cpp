@@ -31,6 +31,28 @@ QSet<TabBar *> &liveTabBars() {
   return s;
 }
 
+// The TabBar currently driving a tear-off drag, or null. Set in
+// startTearOff for the duration of drag->exec and read by a receiving
+// bar's dropEvent to identify the source.
+//
+// Why this exists in addition to the kTearOffOriginRole mime payload:
+// the Qt frontend is Wayland-only, and a tab tear-off drag plus the
+// drop on another window's bar both run in THIS process on THIS thread
+// (the drop is delivered inside the nested event loop that the source's
+// drag->exec spins). Recognising the drag only needs the advertised
+// mime-format LIST (delivered fine), but reading the mime DATA payload
+// (decodeOrigin -> mimeData()->data(...)) forces QtWayland to do a
+// synchronous pipe read from the data source — which can't service the
+// write because it's blocked in the same thread's drag->exec. The read
+// times out empty, decodeOrigin returns null, no adoption happens, and
+// the tab tears off into a new window instead of docking. A plain
+// same-process pointer sidesteps the pipe entirely; the mime payload is
+// kept as a fallback for any (currently non-existent) cross-process
+// path. Single-pointer drag => no race; a hypothetical multi-seat
+// simultaneous tear-off would fall back to the mime payload + live-set
+// validation.
+TabBar *g_tearOffOrigin = nullptr;
+
 // Origin payload: the source PID followed by the originating TabBar*.
 // The PID rejects cross-process delivery; the live-set check rejects
 // same-process pointers whose target was destroyed mid-drag.
@@ -54,6 +76,12 @@ TabBar *decodeOrigin(const QByteArray &bytes) {
   return p.bar;
 }
 }  // namespace
+
+TabBar *currentTearOffOrigin() {
+  if (g_tearOffOrigin && liveTabBars().contains(g_tearOffOrigin))
+    return g_tearOffOrigin;
+  return nullptr;
+}
 
 TabBar::TabBar(QWidget *parent) : QTabBar(parent) {
   liveTabBars().insert(this);
@@ -165,7 +193,14 @@ void TabBar::startTearOff(QMouseEvent *e) {
   // access if we've been deleted.
   m_dropHandled = false;
   QPointer<TabBar> self(this);
+  // Advertise ourselves as the tear-off origin for the duration of the
+  // drag so a receiving bar's dropEvent can identify us without a
+  // Wayland mime-data pipe read (see g_tearOffOrigin). Cleared after
+  // exec — touching the file-scope static is safe even if `this` was
+  // deleted during the nested drag loop.
+  g_tearOffOrigin = this;
   drag->exec(Qt::MoveAction);
+  g_tearOffOrigin = nullptr;
   if (!self) return;
 
   m_tearing = false;
@@ -188,8 +223,15 @@ void TabBar::dropEvent(QDropEvent *e) {
   //     this window. macOS + GTK both support cross-window tab
   //     adoption this way.
   if (e->mimeData()->hasFormat(QString::fromLatin1(kGhosttyTabMime))) {
-    TabBar *origin = decodeOrigin(
-        e->mimeData()->data(QString::fromLatin1(kTearOffOriginRole)));
+    // Prefer the process-local origin: same-process, no Wayland pipe
+    // read (which deadlocks/times out during a same-client drop — see
+    // g_tearOffOrigin). Validate against the live set in case the bar
+    // died mid-drag. Fall back to the mime payload for cross-process.
+    TabBar *origin =
+        (g_tearOffOrigin && liveTabBars().contains(g_tearOffOrigin))
+            ? g_tearOffOrigin
+            : decodeOrigin(
+                  e->mimeData()->data(QString::fromLatin1(kTearOffOriginRole)));
     if (origin) origin->m_dropHandled = true;
     else m_dropHandled = true;
     if (origin && origin != this) {

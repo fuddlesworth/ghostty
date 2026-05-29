@@ -131,23 +131,7 @@ MainWindow::MainWindow() {
   // the source window via TabBar::parentWidget()->parent() and
   // call adoptTab.
   connect(m_tabs, &TabWidget::tabAdoptRequested, this,
-          [this](TabBar *origin) {
-            if (!origin) return;
-            // The TabBar's grandparent is the source MainWindow
-            // (TabBar -> TabWidget -> MainWindow).
-            auto *srcTabs = qobject_cast<TabWidget *>(origin->parentWidget());
-            if (!srcTabs) return;
-            auto *srcWin = qobject_cast<MainWindow *>(srcTabs->parentWidget());
-            if (!srcWin || srcWin == this) return;
-            // Adopt the source's currently-dragged tab. The current
-            // index is the tab being dragged at the time the drop
-            // landed on our bar (startTearOff settled in-bar
-            // reorder before exec, so currentIndex is stable).
-            const int idx = srcTabs->currentIndex();
-            if (idx < 0) return;
-            QWidget *page = srcTabs->widget(idx);
-            if (page) adoptTab(srcWin, page);
-          });
+          [this](TabBar *origin) { adoptTabFromOrigin(origin); });
 }
 
 MainWindow::~MainWindow() {
@@ -580,6 +564,31 @@ void MainWindow::adoptTab(MainWindow *src, QWidget *page) {
     src->m_skipCloseConfirm = true;
     src->close();
   }
+}
+
+bool MainWindow::adoptTabFromOrigin(TabBar *origin) {
+  if (!origin) return false;
+  // The TabBar's grandparent is the source MainWindow
+  // (TabBar -> TabWidget -> MainWindow).
+  auto *srcTabs = qobject_cast<TabWidget *>(origin->parentWidget());
+  if (!srcTabs) return false;
+  auto *srcWin = qobject_cast<MainWindow *>(srcTabs->parentWidget());
+  if (!srcWin || srcWin == this) return false;
+  // Adopt the source's currently-dragged tab. The current index is the
+  // tab being dragged at the time the drop landed (startTearOff settled
+  // any in-bar reorder before exec, so currentIndex is stable).
+  const int idx = srcTabs->currentIndex();
+  if (idx < 0) return false;
+  QWidget *page = srcTabs->widget(idx);
+  if (!page) return false;
+  // Mark the source's tear-off handled BEFORE adoptTab: adoptTab can
+  // close+delete the source window (and `origin` with it) if that
+  // window empties, so touching `origin` afterward could use-after-
+  // free. This also stops the source's startTearOff loop from also
+  // tearing the tab into a new window.
+  origin->markDropHandled();
+  adoptTab(srcWin, page);
+  return true;
 }
 
 void MainWindow::detachTab(int index) {
