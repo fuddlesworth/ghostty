@@ -388,31 +388,26 @@ void GhosttySurface::syncSurfaceSize() {
       // path. The next Show event resets sizing state and triggers
       // a fresh sync, so dropping this is safe.
       //
-      // wp_viewport-stretch the existing buffer to the new dest so
-      // the subsurface keeps covering the whole new parent area.
-      // Without this the subsurface stays at its old buffer size at
-      // position (0,0) and the area beyond it is uncovered — the
-      // parent QWidget's bg-color paint can't reliably catch up
-      // during a fast drag, so the gap shows through to whatever is
-      // behind the window. The stretch is bilinear-filtered (text
-      // briefly distorts), but full coverage with mildly distorted
-      // text is the lesser evil vs. a transparent gap or jumping
-      // back to a solid bg-color flood. The sync-mode child commit
-      // is cached until parent commits, so forceParentCommit applies
-      // it now.
-      m_subsurfacePresenter->resizeDestination(width(), height());
-      forceParentCommit();
-      // Do NOT call ghostty_surface_draw / drainVulkan here. The
-      // ghostty_surface_set_size above mails the IO thread, which
-      // mails the renderer thread (`.resize` message) and notifies
-      // its wakeup (see termio/Termio.zig:500–502). The renderer
-      // thread produces the next frame at the new size on its own
-      // clock and it lands via presentVulkanDmabuf → drainVulkan →
-      // forceParentCommit, replacing the stretched buffer. Running
-      // ghostty_surface_draw inline here blocks the GUI thread on a
-      // full Vulkan render per resize event during a continuous
-      // drag (compositor delivers events at 60–120 Hz), lagging
-      // both window edge tracking and content reflow.
+      // Render at the new size synchronously and commit the proper
+      // new-size buffer — the OpenGL path's behavior (renderTerminal
+      // runs inline on the GUI thread), with no wp_viewport stretch.
+      // ghostty_surface_draw on the Vulkan path blocks until the
+      // renderer thread has produced and parked the new-size frame
+      // (set_size above is mailed ahead of the draw on the same
+      // IO-thread queue, so the parked frame is at the new size), and
+      // the immediately-following drainVulkan consumes it. drainVulkan
+      // calls forceParentCommit at the end, so the sync-mode child
+      // cache + parent commit land atomically — the compositor sees
+      // the parent at the new size and the subsurface at the new size
+      // in the same frame. No stretch, no bilinear text distortion,
+      // no transparent gap.
+      //
+      // This blocks the GUI thread on a full Vulkan render per resize
+      // event — the cost 91b6bb185 traded away for the stretch. We
+      // take it back here in exchange for crisp, never-distorted
+      // resize matching the OpenGL renderer.
+      ghostty_surface_draw(m_surface);
+      drainVulkan();
       return;
     }
 
@@ -2004,22 +1999,51 @@ void GhosttySurface::presentVulkanDmabuf(
   if (m_hidden.load(std::memory_order_acquire)) return;
 
   if (useSubsurface) {
-    // Backpressure the renderer thread to the compositor's refresh
-    // rate. Block here until the GUI thread's wl_surface.frame
-    // callback (onWaylandFrameReady) signals that the previous
-    // commit has retired and the compositor is ready for the next
-    // one. Without this, the renderer's 125 FPS draw timer keeps
-    // submitting GPU work that the paced GUI thread discards —
-    // wasted GPU + renderer-thread CPU.
+    // Frame-pacing backpressure — but ONLY for the renderer thread.
     //
-    // 100 ms timeout is a safety net: if the compositor stalls
-    // (lid closed, monitor disconnect, application minimized
-    // mid-flight) we don't want the renderer thread blocked
-    // forever. On timeout we proceed and overwrite the parked
-    // dmabuf — same drop semantic as pre-backpressure. The
-    // predicate also bails on m_hidden so Hide can wake the
-    // renderer immediately without paying the timeout.
-    {
+    // present() (this callback) is invoked inline by the generic
+    // renderer's drawFrame on whatever thread called it (drawFrame
+    // renders + presents synchronously on the caller — see
+    // renderer/generic.zig drawFrame and Surface.zig:881, which
+    // requires drawFrame to be callable from the main thread "during
+    // a resize"). Two callers reach here:
+    //
+    //   - Renderer thread: libghostty's free-running ~125 FPS draw
+    //     timer (renderer/Thread.zig). This MUST be throttled to the
+    //     compositor's refresh, else it submits GPU work the paced
+    //     GUI thread just discards — wasted GPU + CPU. We block it
+    //     below until the wl_surface.frame callback (onWaylandFrameReady)
+    //     signals the compositor retired the previous commit.
+    //
+    //   - GUI thread: explicit ghostty_surface_draw from
+    //     renderTerminal / syncSurfaceSize (resize, dirty repaint).
+    //     These are one-shots already rate-limited by their trigger;
+    //     they do NOT need throttling. Blocking the GUI thread here is
+    //     exactly the resize lag — up to one vsync (100 ms on a
+    //     compositor stall) per resize event at 60–120 Hz drag rate,
+    //     which is what 91b6bb185 traded crispness away to avoid.
+    //     Skip the wait for this caller so the inline resize draw
+    //     parks immediately and the inline drainVulkan commits a
+    //     crisp new-size frame without ever blocking.
+    //
+    // Discriminate by caller thread identity rather than a resize
+    // flag: QObject::thread() is the GUI thread this surface lives on.
+    // This is intrinsically correct for ALL inline GUI-thread draws
+    // (resize today, animations / manual render-timer paths tomorrow)
+    // with no "remember to set the flag" contract to forget. The
+    // draw_mutex in drawFrame already serializes the two callers, so
+    // they never render concurrently; a stale wrong-size frame from a
+    // racing renderer-thread draw is dropped by drainVulkan's
+    // wrong-size guard, so no sequence counter is needed.
+    const bool onRendererThread = thread() != QThread::currentThread();
+    if (onRendererThread) {
+      // 100 ms timeout is a safety net: if the compositor stalls
+      // (lid closed, monitor disconnect, application minimized
+      // mid-flight) we don't want the renderer thread blocked
+      // forever. On timeout we proceed and overwrite the parked
+      // dmabuf — same drop semantic as pre-backpressure. The
+      // predicate also bails on m_hidden so Hide can wake the
+      // renderer immediately without paying the timeout.
       std::unique_lock<std::mutex> lk(m_compositorMutex);
       m_compositorCv.wait_for(lk, std::chrono::milliseconds(100),
                               [this] {
@@ -2032,6 +2056,9 @@ void GhosttySurface::presentVulkanDmabuf(
       if (m_hidden.load(std::memory_order_acquire)) return;
       m_compositorReady = false;
     }
+    // GUI-thread bypass intentionally does NOT touch m_compositorReady:
+    // it consumed no pacing token, so the renderer thread's gate state
+    // is left exactly as the frame callbacks set it.
 
     // Dup the dmabuf fd BEFORE parking. The fd from libghostty is
     // only guaranteed valid inside this present() callback —
