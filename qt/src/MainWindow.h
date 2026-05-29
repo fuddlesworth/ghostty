@@ -11,6 +11,7 @@ class QCloseEvent;
 class QShowEvent;
 class QSplitter;
 class TabWidget;
+class TabBar;
 class QTimer;
 class CommandPalette;
 class GhosttySurface;
@@ -176,6 +177,14 @@ public:
   // once via ghostty_app_needs_confirm_quit. `thenQuit=true` is the
   // QUIT action's behavior; `thenQuit=false` is CLOSE_ALL_WINDOWS.
   static void closeAllWindows(bool thenQuit);
+
+  // Resolve the source window + dragged page from a tear-off origin
+  // bar and adopt it into this window. Used by both the cross-window
+  // tab-bar drop and a tab dropped on this window's terminal surface
+  // (GhosttySurface::dropEvent). Marks the origin's tear-off handled
+  // (before any source-window teardown) and returns true if a tab was
+  // adopted; false if the origin is invalid or belongs to this window.
+  bool adoptTabFromOrigin(TabBar *origin);
 
 protected:
   bool event(QEvent *) override;

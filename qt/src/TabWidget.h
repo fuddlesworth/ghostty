@@ -15,6 +15,16 @@ class QMouseEvent;
 // so no "forbidden" cursor is shown over a Ghastty window).
 inline constexpr char kGhosttyTabMime[] = "application/x-ghastty-tab";
 
+class TabBar;
+
+// The TabBar currently driving a tear-off drag (set for the duration
+// of its drag->exec), validated against the live-bar set, or null.
+// Lets a drop target identify the source without a Wayland mime-data
+// pipe read (which deadlocks during a same-client drop — see the
+// definition in TabWidget.cpp). Used by terminal surfaces to adopt a
+// tab dropped on their area, mirroring the tab-bar drop path.
+TabBar *currentTearOffOrigin();
+
 // Per-tab data stored in QTabBar::tabData. `base` is the terminal-set
 // title (libghostty SET_TITLE); `override` is a manual user-set title
 // (libghostty SET_TAB_TITLE). updateTabText shows override when set,
@@ -35,6 +45,12 @@ class TabBar : public QTabBar {
 public:
   explicit TabBar(QWidget *parent = nullptr);
   ~TabBar() override;
+
+  // Mark this bar's in-progress tear-off as handled so its
+  // startTearOff loop does NOT also tear the tab into a new window.
+  // Called by a receiving drop target (another window's tab bar, or
+  // another window's terminal surface) once it has adopted the tab.
+  void markDropHandled() { m_dropHandled = true; }
 
 signals:
   // The tab was dragged off and released clear of its window.

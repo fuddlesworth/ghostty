@@ -466,6 +466,17 @@ private:
   // (linux-dmabuf-v1, viewporter, subcompositor), in which case
   // the legacy mmap+memcpy+QImage+QPainter path renders pixels.
   std::unique_ptr<wayland::SubsurfacePresenter> m_subsurfacePresenter;
+  // The top-level QWindow the presenter was built against. A tab
+  // tear-off (or any cross-window reparent) re-homes this widget
+  // under a DIFFERENT top-level wl_surface. Because this widget is
+  // not a native window, it gets no PlatformSurface destroy event on
+  // that reparent (unlike a QSplitter reparent of a native child),
+  // so without comparing against this the lazily-created presenter
+  // would stay bound to the old window's wl_surface — the torn-off
+  // window then shows nothing (transparent) and never renders. Used
+  // only for pointer-identity comparison in the Show handler; never
+  // dereferenced (stored as void* to avoid a QWindow include).
+  void *m_presenterTopLevel = nullptr;
   // Per-surface latch for the first-dmabuf log breadcrumb so each
   // pane / split prints its own line on first frame. Atomic because
   // the renderer thread is what hits `presentVulkanDmabuf` and the

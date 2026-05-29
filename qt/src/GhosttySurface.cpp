@@ -194,7 +194,25 @@ GhosttySurface::GhosttySurface(ghostty_app_t app, MainWindow *owner,
   }
 #endif
   sc.userdata = this;
-  sc.scale_factor = devicePixelRatioF();
+  // Fork the shell at the OWNER WINDOW's device pixel ratio, not this
+  // widget's. A freshly-constructed GhosttySurface has not yet been
+  // shown or associated with a screen, so its devicePixelRatioF()
+  // returns the PRIMARY screen's scale — which on a multi-monitor
+  // setup with mixed scales differs from the window's actual screen
+  // (e.g. primary 2.0 while the window lives on a 1.2 monitor). The
+  // shell + PTY are forked inside ghostty_surface_new using this
+  // scale, so a wrong (too-large) value makes the initial cell size
+  // too big: libghostty reports few columns with large per-cell
+  // pixels, and fastfetch (and any kitty-graphics tool) bakes its
+  // image at that oversized cell size — rendered as a giant logo
+  // filling the pane. It's intermittent because it depends on whether
+  // the child's screen association has settled by fork time, and a
+  // re-run after the surface's scale corrects looks fine. The owner
+  // MainWindow is already shown on its real screen, so its DPR is the
+  // correct, settled value. Fall back to our own only if there is no
+  // owner (shouldn't happen for a real surface).
+  sc.scale_factor =
+      m_owner ? m_owner->devicePixelRatioF() : devicePixelRatioF();
 
   m_surface = ghostty_surface_new(m_app, &sc);
   if (!m_surface) {
@@ -590,6 +608,7 @@ bool GhosttySurface::event(QEvent *e) {
       }
 #endif
       m_subsurfacePresenter.reset();
+      m_presenterTopLevel = nullptr;
       // Presenter is gone — no frame_done callback will arrive.
       // Reset the gate so the rebuilt presenter's first present
       // (on next Show) goes through immediately, AND wake the
@@ -648,6 +667,36 @@ bool GhosttySurface::event(QEvent *e) {
       // about the widget's actual size before the renderer's next
       // frame, regardless of whether resizeEvent fires.
       syncSurfaceSize();
+      // A tab tear-off (or any cross-window reparent) re-homes this
+      // widget under a NEW top-level wl_surface. Unlike a QSplitter
+      // reparent of a native child, this non-native widget receives
+      // no PlatformSurface destroy event, so the lazily-created
+      // presenter below would otherwise stay bound to the OLD
+      // top-level's wl_surface: the torn-off window shows nothing
+      // (WA_TranslucentBackground paints through) and never renders.
+      // Detect the change by comparing the current top-level against
+      // the one the presenter was built against, and drop the stale
+      // presenter so the rebuild block below re-creates it against
+      // the new top-level. Done BEFORE the reattachCached block so we
+      // never reattach onto the stale (wrong-window) subsurface.
+      {
+        QWindow *topNow = window() ? window()->windowHandle() : nullptr;
+        if (m_subsurfacePresenter && topNow &&
+            static_cast<void *>(topNow) != m_presenterTopLevel) {
+          m_subsurfacePresenter.reset();
+          m_presenterTopLevel = nullptr;
+          // The cached QWaylandWindow cast belonged to the old
+          // top-level's QPA handle; invalidate it so forceParentCommit
+          // re-resolves against the new top-level.
+          m_cachedWaylandWindow = nullptr;
+          m_useSubsurface.store(false, std::memory_order_release);
+          // No buffer is attached to the (about-to-be-rebuilt)
+          // subsurface yet — paintEvent should fall back to the
+          // bg-color placeholder until the renderer delivers a frame
+          // for the new surface.
+          m_subsurfaceHasFrame.store(false, std::memory_order_release);
+        }
+      }
       // Re-attach the last-presented dmabuf immediately on Show.
       // Without this, Hide had attached a NULL buffer (so the
       // pane's old frame wouldn't ghost over the active tab) and
@@ -715,6 +764,10 @@ bool GhosttySurface::event(QEvent *e) {
           m_subsurfacePresenter =
               wayland::SubsurfacePresenter::tryCreate(top);
           if (m_subsurfacePresenter) {
+            // Remember which top-level we bound to so a later
+            // cross-window reparent (tab tear-off) can detect the
+            // change and rebuild against the new top-level.
+            m_presenterTopLevel = static_cast<void *>(top);
             // Set initial position to our offset within the top-level.
             // moveEvent updates it on layout changes.
             const QPoint pos = mapTo(window(), QPoint(0, 0));
@@ -1710,9 +1763,19 @@ static QString shellQuote(const QString &s) {
 
 void GhosttySurface::dropEvent(QDropEvent *ev) {
   const QMimeData *mime = ev->mimeData();
-  // A tab tear-off released on the terminal: accept it cleanly and let
-  // the tear-off code turn it into a new window.
+  // A tab tear-off released on the terminal area.
   if (mime->hasFormat(QString::fromLatin1(kGhosttyTabMime))) {
+    // If it came from a DIFFERENT window, dock it into this window
+    // (the one owning this surface), mirroring a drop on this window's
+    // tab bar. Dropping on its OWN window's surface falls through to
+    // the tear-off path below (released clear of its bar → new window).
+    TabBar *origin = currentTearOffOrigin();
+    if (origin && m_owner && m_owner->adoptTabFromOrigin(origin)) {
+      ev->acceptProposedAction();
+      return;
+    }
+    // Same-window (or unresolved) drop: accept cleanly and let the
+    // tear-off code turn it into a new window.
     ev->acceptProposedAction();
     return;
   }
